@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 from collections import defaultdict
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 # ---------------------------------------------------------------------------
 # Path setup — allow running from any working directory
@@ -73,6 +74,7 @@ class LazyHDF5Dataset(Dataset):
         hdf5_path:        str,
         snr_range:        tuple | None = None,
         held_out_classes: list  | None = None,
+        max_samples:      int   | None = None,
     ):
         self._path = hdf5_path
         self._file = None   # opened lazily per-process in __getitem__
@@ -102,9 +104,21 @@ class LazyHDF5Dataset(Dataset):
         self._labels  = torch.from_numpy(labels[mask])
         self._snrs    = torch.from_numpy(Z[mask].astype(np.float32))
 
-        n_total   = len(labels)
-        n_kept    = int(mask.sum())
-        print(f"  Dataset: {n_kept:,} / {n_total:,} samples selected", flush=True)
+        n_total = len(labels)
+        n_kept  = len(self._indices)
+
+        # Optional random subsample — sorted to keep HDF5 access sequential
+        if max_samples is not None and max_samples < n_kept:
+            rng     = np.random.default_rng(42)
+            chosen  = rng.choice(n_kept, size=max_samples, replace=False)
+            chosen.sort()
+            self._indices = self._indices[chosen]
+            self._labels  = self._labels[chosen]
+            self._snrs    = self._snrs[chosen]
+            print(f"  Dataset: {max_samples:,} / {n_total:,} samples "
+                  f"(subsampled from {n_kept:,} after filtering)", flush=True)
+        else:
+            print(f"  Dataset: {n_kept:,} / {n_total:,} samples selected", flush=True)
 
     # ------------------------------------------------------------------
     def _open_file(self):
@@ -136,11 +150,13 @@ def make_loaders(
     batch_size:       int,
     snr_range:        tuple | None,
     held_out_classes: list  | None,
+    max_samples:      int   | None = None,
     num_workers:      int = 0,
     seed:             int = 42,
 ) -> dict:
     """Split dataset 80/10/10 and return DataLoaders."""
-    ds = LazyHDF5Dataset(hdf5_path, snr_range=snr_range, held_out_classes=held_out_classes)
+    ds = LazyHDF5Dataset(hdf5_path, snr_range=snr_range,
+                         held_out_classes=held_out_classes, max_samples=max_samples)
 
     n       = len(ds)
     n_train = int(n * 0.80)
@@ -266,6 +282,8 @@ def eval_one_epoch(
     total_loss = 0.0
     correct    = 0
     total      = 0
+    all_preds  = []
+    all_labels = []
 
     bar = tqdm(loader, desc=f"  {label}", leave=False, unit="batch", ncols=100)
 
@@ -288,10 +306,20 @@ def eval_one_epoch(
             total_loss += loss.item() * bs
             correct    += preds.eq(labels).sum().item()
             total      += bs
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
             bar.set_postfix(loss=f"{total_loss/total:.4f}", acc=f"{correct/total:.4f}")
 
-    return {"loss": total_loss / total, "acc": correct / total}
+    np_preds  = np.array(all_preds)
+    np_labels = np.array(all_labels)
+    return {
+        "loss":      total_loss / total,
+        "acc":       correct / total,
+        "f1":        f1_score(np_labels, np_preds, average="weighted", zero_division=0),
+        "precision": precision_score(np_labels, np_preds, average="weighted", zero_division=0),
+        "recall":    recall_score(np_labels, np_preds, average="weighted", zero_division=0),
+    }
 
 
 def snr_breakdown(
@@ -344,6 +372,7 @@ def train_model(
     snr_range:        tuple | None,
     held_out_classes: list,
     device:           torch.device,
+    max_samples:      int   | None = None,
 ) -> tuple[nn.Module, dict]:
     """
     Train one model end-to-end.
@@ -365,6 +394,7 @@ def train_model(
         batch_size       = batch_size,
         snr_range        = snr_range,
         held_out_classes = held_out_classes,
+        max_samples      = max_samples,
         num_workers      = 0,   # 0 = safe for HDF5 on Windows
     )
 
@@ -411,10 +441,12 @@ def train_model(
         print(
             f"  Epoch {epoch:>3}/{epochs}"
             f"  train_loss={train_m['loss']:.4f}  train_acc={train_m['acc']:.4f}"
-            f"  val_loss={val_m['loss']:.4f}  val_acc={val_m['acc']:.4f}"
+            f"  val_acc={val_m['acc']:.4f}"
+            f"  val_f1={val_m['f1']:.4f}"
+            f"  val_prec={val_m['precision']:.4f}"
+            f"  val_rec={val_m['recall']:.4f}"
             f"  lr={lr_now:.2e}"
-            f"  epoch={_fmt_time(epoch_elapsed)}"
-            f"  ETA={_fmt_time(eta_s)}"
+            f"  {_fmt_time(epoch_elapsed)}  ETA={_fmt_time(eta_s)}"
         )
 
         # Checkpoint
@@ -435,9 +467,12 @@ def train_model(
     test_snrs = snr_breakdown(model, loaders["test"], device, is_baseline)
 
     print(f"\n  ── {label} Final Results ──")
-    print(f"  Best val acc : {best_val_acc:.4f}")
-    print(f"  Test acc     : {test_m['acc']:.4f}")
-    print(f"  Test loss    : {test_m['loss']:.4f}")
+    print(f"  Best val acc   : {best_val_acc:.4f}")
+    print(f"  Test acc       : {test_m['acc']:.4f}")
+    print(f"  Test F1        : {test_m['f1']:.4f}  (weighted)")
+    print(f"  Test precision : {test_m['precision']:.4f}  (weighted)")
+    print(f"  Test recall    : {test_m['recall']:.4f}  (weighted)")
+    print(f"  Test loss      : {test_m['loss']:.4f}")
 
     return model, test_snrs
 
@@ -452,6 +487,7 @@ def fit_open_set_detector(
     batch_size:    int,
     save_dir:      str,
     device:        torch.device,
+    max_samples:   int | None = None,
 ) -> None:
     """Fit EnergyOpenSetDetector on the known-class validation split and save."""
     print(f"\n{'─'*58}")
@@ -465,6 +501,7 @@ def fit_open_set_detector(
         batch_size       = batch_size,
         snr_range        = None,
         held_out_classes = None,
+        max_samples      = max_samples,
         num_workers      = 0,
     )
 
@@ -544,7 +581,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--data_path",
-        default=os.path.join("specter", "data", "raw", "radio_ML",
+        default=os.path.join(_HERE, "data", "raw", "radio_ML",
                              "GOLD_XYZ_OSC.0001_1024.hdf5"),
         help="Path to RadioML 2018.01A HDF5 file",
     )
@@ -562,6 +599,30 @@ def parse_args() -> argparse.Namespace:
         help="Train only on -20 dB to -6 dB SNR range",
     )
     p.add_argument(
+        "--snr_min",
+        type=float,
+        default=None,
+        help="Lower bound of custom SNR range in dB (overrides --low_snr_only)",
+    )
+    p.add_argument(
+        "--snr_max",
+        type=float,
+        default=None,
+        help="Upper bound of custom SNR range in dB (overrides --low_snr_only)",
+    )
+    p.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Randomly subsample this many total samples (after SNR/class filtering). "
+             "Useful for fast iteration. Example: --max_samples 200000",
+    )
+    p.add_argument(
+        "--quick_test",
+        action="store_true",
+        help="Quick end-to-end smoke test: forces epochs=3, max_samples=50000, batch_size=256",
+    )
+    p.add_argument(
         "--holdout_classes",
         default="20,21,22,23",
         help="Comma-separated class indices to exclude (open-set validation split). "
@@ -569,7 +630,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--save_dir",
-        default=os.path.join("specter", "results"),
+        default=os.path.join(_HERE, "results"),
         help="Directory for checkpoints and threshold files",
     )
     return p.parse_args()
@@ -581,6 +642,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # --- quick_test overrides (applied before anything else) -----------------
+    if args.quick_test:
+        args.epochs      = 3
+        args.max_samples = 50_000
+        args.batch_size  = 256
+        print("\n  ╔══════════════════════════════════════════╗")
+        print("  ║           QUICK TEST MODE                ║")
+        print("  ║  epochs=3  max_samples=50k  batch=256   ║")
+        print("  ║  Verifying end-to-end pipeline only.     ║")
+        print("  ╚══════════════════════════════════════════╝")
 
     # --- validate paths ------------------------------------------------------
     data_path = os.path.abspath(args.data_path)
@@ -600,8 +672,17 @@ def main() -> None:
     else:
         print("\n  No CUDA GPU detected — training on CPU (will be slow)")
 
-    # --- config summary ------------------------------------------------------
-    snr_range = (-20, -6) if args.low_snr_only else None
+    # --- SNR range -----------------------------------------------------------
+    # --snr_min/--snr_max take priority; fall back to --low_snr_only
+    if args.snr_min is not None or args.snr_max is not None:
+        lo        = args.snr_min if args.snr_min is not None else -20.0
+        hi        = args.snr_max if args.snr_max is not None else  30.0
+        snr_range = (lo, hi)
+    elif args.low_snr_only:
+        snr_range = (-20, -6)
+    else:
+        snr_range = None
+
     held_out  = [int(c.strip()) for c in args.holdout_classes.split(",") if c.strip()]
     class_names = get_class_names()
     held_names  = [class_names[i] for i in held_out if i < len(class_names)]
@@ -612,6 +693,7 @@ def main() -> None:
     print(f"  ├─ epochs         : {args.epochs}")
     print(f"  ├─ batch_size     : {args.batch_size}")
     print(f"  ├─ snr_range      : {snr_range if snr_range else 'all'}")
+    print(f"  ├─ max_samples    : {args.max_samples if args.max_samples else 'all'}")
     print(f"  ├─ holdout        : {held_out} → {held_names}")
     print(f"  └─ save_dir       : {save_dir}")
 
@@ -630,6 +712,7 @@ def main() -> None:
             snr_range        = snr_range,
             held_out_classes = held_out,
             device           = device,
+            max_samples      = args.max_samples,
         )
 
     if args.model in ("specter", "both"):
@@ -642,6 +725,7 @@ def main() -> None:
             snr_range        = snr_range,
             held_out_classes = held_out,
             device           = device,
+            max_samples      = args.max_samples,
         )
 
     # --- fit open-set detector (specter only) --------------------------------
@@ -652,6 +736,7 @@ def main() -> None:
             batch_size    = args.batch_size,
             save_dir      = save_dir,
             device        = device,
+            max_samples   = args.max_samples,
         )
 
     # --- benchmark table -----------------------------------------------------

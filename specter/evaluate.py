@@ -33,7 +33,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import confusion_matrix, roc_curve, auc
+from sklearn.metrics import (
+    confusion_matrix, roc_curve, auc,
+    f1_score, precision_score, recall_score,
+)
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
@@ -388,6 +391,60 @@ def plot_confusion_matrix(
 
 
 # ============================================================
+# Section 2b — Per-Class F1 Bar Chart
+# ============================================================
+
+def plot_per_class_f1(
+    preds:  np.ndarray,
+    labels: np.ndarray,
+    title:  str,
+    path:   str,
+) -> None:
+    """Horizontal bar chart of per-class F1 scores, saved to path."""
+    f1_per_class = f1_score(
+        labels, preds,
+        average=None,
+        labels=list(range(NUM_CLASSES)),
+        zero_division=0,
+    )
+
+    # Sort by F1 ascending so weakest classes appear at top (easiest to scan)
+    order       = np.argsort(f1_per_class)
+    sorted_f1   = f1_per_class[order]
+    sorted_names = [CLASS_NAMES[i] for i in order]
+    colors      = ["crimson" if f < 0.5 else "steelblue" for f in sorted_f1]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    bars = ax.barh(sorted_names, sorted_f1, color=colors, edgecolor="white", linewidth=0.4)
+
+    ax.axvline(x=0.5, color="grey", linestyle="--", linewidth=1.2, alpha=0.6,
+               label="F1 = 0.50 threshold")
+
+    for bar, val in zip(bars, sorted_f1):
+        ax.text(
+            min(val + 0.01, 1.00), bar.get_y() + bar.get_height() / 2,
+            f"{val:.3f}", va="center", fontsize=8,
+            color="black",
+        )
+
+    overall_f1 = f1_score(labels, preds, average="weighted", zero_division=0)
+    ax.set_xlim(0, 1.10)
+    ax.set_xlabel("F1 Score", fontsize=12)
+    ax.set_title(
+        f"{title} — Per-Class F1 Score\n"
+        f"Weighted avg F1 = {overall_f1:.3f}  |  "
+        f"{int((f1_per_class >= 0.5).sum())}/{NUM_CLASSES} classes ≥ 0.50",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(fontsize=9, loc="lower right")
+    ax.grid(True, alpha=0.25, axis="x")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ============================================================
 # Section 3 — Open-Set AUROC
 # ============================================================
 
@@ -583,31 +640,40 @@ def measure_latency(
 # ============================================================
 
 def print_summary_table(
-    b_overall:  float | None,
-    b_low_snr:  float | None,
-    b_lat_1:    float | None,
-    s_overall:  float | None,
-    s_low_snr:  float | None,
-    s_auroc:    float | None,
-    s_lat_1:    float | None,
+    b_overall:   float | None,
+    b_low_snr:   float | None,
+    b_precision: float | None,
+    b_recall:    float | None,
+    b_f1:        float | None,
+    b_lat_1:     float | None,
+    s_overall:   float | None,
+    s_low_snr:   float | None,
+    s_precision: float | None,
+    s_recall:    float | None,
+    s_f1:        float | None,
+    s_auroc:     float | None,
+    s_lat_1:     float | None,
 ) -> None:
 
     def _pct(v): return f"{v*100:.1f}%" if v is not None else "N/A"
-    def _ms(v):  return f"{v:.2f} ms"  if v is not None else "N/A"
-    def _flt(v): return f"{v:.3f}"     if v is not None else "N/A"
+    def _ms(v):  return f"{v:.1f} ms"   if v is not None else "N/A"
+    def _flt(v): return f"{v:.3f}"      if v is not None else "N/A"
 
     rows = [
-        ("Overall Accuracy",  _pct(b_overall), _pct(s_overall)),
-        ("Low SNR Accuracy",  _pct(b_low_snr), _pct(s_low_snr)),
-        ("Open-Set AUROC",    "N/A",            _flt(s_auroc)),
-        ("Inference (bs=1)",  _ms(b_lat_1),     _ms(s_lat_1)),
+        ("Overall Accuracy",  _pct(b_overall),   _pct(s_overall)),
+        ("Low SNR Accuracy",  _pct(b_low_snr),   _pct(s_low_snr)),
+        ("Precision",         _flt(b_precision),  _flt(s_precision)),
+        ("Recall",            _flt(b_recall),     _flt(s_recall)),
+        ("F1 Score",          _flt(b_f1),         _flt(s_f1)),
+        ("Open-Set AUROC",    "N/A",              _flt(s_auroc)),
+        ("Inference (ms)",    _ms(b_lat_1),       _ms(s_lat_1)),
     ]
 
     W = [20, 14, 15]
-    bar = "─" * (W[0] + W[1] + W[2] + 7)
+    inner = W[0] + W[1] + W[2] + 7
 
-    print(f"\n  ┌{'─'*bar}┐")
-    print(f"  │{'SPECTER BENCHMARK RESULTS':^{len(bar)}}│")
+    print(f"\n  ┌{'─'*inner}┐")
+    print(f"  │{'SPECTER BENCHMARK RESULTS':^{inner}}│")
     print(f"  ├{'─'*W[0]}┬{'─'*W[1]}┬{'─'*W[2]}┤")
     print(f"  │ {'Metric':<{W[0]-2}} │ {'Baseline':<{W[1]-2}} │ {'SPECTER':<{W[2]-2}} │")
     print(f"  ├{'─'*W[0]}┼{'─'*W[1]}┼{'─'*W[2]}┤")
@@ -793,10 +859,44 @@ def main() -> None:
             return None
         return float((preds[mask] == labels[mask]).mean())
 
+    def _weighted_metrics(preds, labels):
+        """Return (f1, precision, recall) weighted, or (None, None, None)."""
+        if preds is None:
+            return None, None, None
+        kw = dict(average="weighted", zero_division=0)
+        return (
+            float(f1_score(labels, preds, **kw)),
+            float(precision_score(labels, preds, **kw)),
+            float(recall_score(labels, preds, **kw)),
+        )
+
     b_overall = _overall_acc(b_preds, b_labels)
     b_low_snr = _low_snr_acc(b_preds, b_labels, b_snrs)
+    b_f1, b_prec, b_rec = _weighted_metrics(b_preds, b_labels)
+
     s_overall = _overall_acc(s_preds, s_labels)
     s_low_snr = _low_snr_acc(s_preds, s_labels, s_snrs)
+    s_f1, s_prec, s_rec = _weighted_metrics(s_preds, s_labels)
+
+    # ────────────────────────────────────────────────────────────────────
+    # Section 2b: Per-Class F1 Charts
+    # ────────────────────────────────────────────────────────────────────
+    print(f"\n{'═'*58}")
+    print("  Section 2b — Per-Class F1 Score Charts")
+    print(f"{'═'*58}")
+
+    if baseline is not None and b_preds is not None:
+        plot_per_class_f1(
+            b_preds, b_labels,
+            title="Baseline VT-CNN2",
+            path=os.path.join(save_dir, "per_class_f1_baseline.png"),
+        )
+    if specter is not None and s_preds is not None:
+        plot_per_class_f1(
+            s_preds, s_labels,
+            title="SPECTER-CNN",
+            path=os.path.join(save_dir, "per_class_f1.png"),
+        )
 
     # ────────────────────────────────────────────────────────────────────
     # Section 6: Final Summary Table
@@ -805,13 +905,19 @@ def main() -> None:
     print("  Section 6 — Final Competition Summary")
     print(f"{'═'*58}")
     print_summary_table(
-        b_overall = b_overall,
-        b_low_snr = b_low_snr,
-        b_lat_1   = b_lat[1]   if b_lat else None,
-        s_overall = s_overall,
-        s_low_snr = s_low_snr,
-        s_auroc   = s_auroc,
-        s_lat_1   = s_lat[1]   if s_lat else None,
+        b_overall   = b_overall,
+        b_low_snr   = b_low_snr,
+        b_precision = b_prec,
+        b_recall    = b_rec,
+        b_f1        = b_f1,
+        b_lat_1     = b_lat[1]  if b_lat else None,
+        s_overall   = s_overall,
+        s_low_snr   = s_low_snr,
+        s_precision = s_prec,
+        s_recall    = s_rec,
+        s_f1        = s_f1,
+        s_auroc     = s_auroc,
+        s_lat_1     = s_lat[1]  if s_lat else None,
     )
 
     print("  Evaluation complete.\n")
